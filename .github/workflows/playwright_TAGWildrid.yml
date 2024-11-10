@@ -1,0 +1,156 @@
+name: Playwright manual Tests with TAG
+on:
+    workflow_dispatch:
+        inputs:
+            testName:
+                description: 'Test CDM number (CDM-XXXX)'
+                required: true
+                type: string
+
+env:
+  VAULT_ADDR: https://vault.factory.adeo.cloud
+  VAULT_NAMESPACE: adeo/playwright
+  PATH_TO_SECRETS: playwright
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup-and-run-tests:
+    name: 🎮 GUI Tests ${{ github.event.inputs.testName }} on  ${{ matrix.bu }}-${{ matrix.env-name }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bu: ["lmfr", "lmes"]
+        env-name: ["uat"]
+        exclude:
+          - bu: lmes
+            env-name: uat
+    steps:
+      - name: 🔐 Get secrets from Vault
+        uses: adeo/vault-action@v1
+        with:
+          exportToken: true
+          vault-namespace: ${{ env.VAULT_NAMESPACE }}
+          vault-jwt-role-name: ${{ github.event.repository.name }}
+          vault-secrets: |
+            secret/data/_services/jfrog reader_user_auth_token | JFROG_READER_AUTH_TOKEN ;
+            secret/data/playwright/ci JIRA_TOKEN ;
+      - name: ⬇️ Checkout the latest code
+        uses: actions/checkout@v4
+      - name: ⬇️ install node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+      - name: 🎮 ${{ matrix.bu }} ${{ matrix.env-name }} - Run GUI Playwright tests on ${{ github.event.inputs.testName }}
+        run: CONTEXT=${{ matrix.bu }}-${{ matrix.env-name }} npx playwright test --grep-invert @skip --grep "${{ github.event.inputs.testName }}"
+        if: success()
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        if: always()        
+        with:
+          name: results-${{ matrix.bu }}-${{ matrix.env-name }}.json
+          path: ./reports/results-${{ matrix.bu }}-${{ matrix.env-name }}.json
+          retention-days: 1
+
+  merge-reports-and-upload:
+    # Merge reports after playwright tests, even if some jobs have failed
+    if: ${{ !cancelled() }}
+    needs: [setup-and-run-tests]
+    runs-on: ubuntu-latest
+    outputs:
+      timestamp: ${{ steps.timestampid.outputs.timestamp }}
+
+    steps:
+      - name: 🔐 Get secrets from Vault
+        uses: adeo/vault-action@v1
+        with:
+          exportToken: true
+          vault-namespace: ${{ env.VAULT_NAMESPACE }}
+          vault-jwt-role-name: ${{ github.event.repository.name }}
+          vault-secrets: |
+            secret/data/_services/jfrog reader_user_auth_token | JFROG_READER_AUTH_TOKEN ;
+            secret/data/playwright/ci JIRA_TOKEN ;
+
+      # We want a unique identifier to be used when we create subdirectories for our github pages with reports
+      - name: Set a timestamp
+        id: timestampid
+        # this will store current time with UTC in outputs.timestamp (eg of value: 20231028_233147Z)
+        run: echo "timestamp=$(date +%Y%m%d_%H%M%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4.0.0
+      - uses: actions/setup-node@v4.0.0
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      # we now download the reports uploaded previously to merge them and create one single html report
+      - name: Download blob reports from GitHub Actions Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-blob-reports # name of the folder where the download will be saved
+          pattern: blob-report-*
+          merge-multiple: true
+      - name: "Debug: List files in the directory all-blob-reports"
+        run: ls -R ./all-blob-reports
+
+      # Playwright will generate a report and store it inside a folder called '/playwright-report'
+      - name: Create report directory
+        run: mkdir -p playwright-report
+      - name: Merge the blobs into one single HTML Report
+        run: npx playwright merge-reports --reporter html ./all-blob-reports
+      - name: Move the merged report to the playwright-report folder
+        run: mv ./all-blob-reports/report* ./playwright-report/
+      - name: "Debug: List files in the directory playwright-report"
+        run: ls -R ./playwright-report
+
+      # Upload the merged report to GitHub Actions Artifacts
+      - name: "[OPTIONAL] Upload full html report to artifacts for history"
+        if: always()
+        uses: actions/upload-artifact@v4.0.0
+        with:
+          name: playwright-report-${{ steps.timestampid.outputs.timestamp }} # name of the file you want to have once its uploaded
+          path: playwright-report # path where the reports are, from where to take the files
+          retention-days: 2
+
+      # - name: Get Allure history
+      #   uses: actions/checkout@v4
+      #   if: always()
+      #   continue-on-error: true
+      #   with:
+      #     ref: gh-pages
+      #     path: gh-pages
+
+      # - name: Build Allure Report
+      #   uses: simple-elf/allure-report-action@master
+      #   if: always()
+      #   id: allure-report
+      #   with:
+      #     allure_results: allure-results
+      #     gh_pages: gh-pages
+      #     allure_report: allure-report
+      #     allure_history: allure-history
+      #     keep_reports: 10
+
+      # - name: Deploy report to Github Pages
+      #   if: always()
+      #   uses: peaceiris/actions-gh-pages@v4
+      #   with:
+      #     github_token: ${{ secrets.GITHUB_TOKEN }}
+      #     publish_branch: gh-pages
+      #     publish_dir: allure-history
+      #     allow_empty_commit: true

@@ -1,0 +1,93 @@
+name: Playwright Tests
+on:
+  push:
+    branches: [main, master, autom]
+  pull_request:
+    branches: [main, master, autom]
+
+env:
+  VAULT_ADDR: https://vault.factory.adeo.cloud
+  VAULT_NAMESPACE: adeo/playwright
+  PATH_TO_SECRETS: playwright
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # SECURITY: SECRET DETECTION
+  security-detect-secrets-scan:
+    name: 🔒 Scan for secret
+    uses: adeo/dxp--reusable-github-actions-workflows/.github/workflows/security-detect-secrets-scan.yml@v1
+    with:
+      exclude-file-list: (.git/FETCH_HEAD|package-lock.json)
+
+  eslint:
+    name: 🔎 Run ESLint
+    timeout-minutes: 30
+    runs-on: [self-hosted, Linux, standard]
+    steps:
+        - uses: actions/checkout@v3
+        - uses: adeo/vault-action@v1
+          with:
+              exportToken: true
+              vault-namespace: ${{ env.VAULT_NAMESPACE }}
+              vault-jwt-role-name: ${{ github.event.repository.name }}
+              vault-secrets: |
+                  secret/data/_services/jfrog reader_user_auth_token | JFROG_READER_AUTH_TOKEN ;
+        - uses: actions/setup-node@v3
+          with:
+              node-version: 20
+        - name: Install dependencies
+          run: npm install
+        - name: Run ESLint
+          run: npx eslint .
+
+  setup-and-run-tests:
+    name: 🎮 GUI Tests ${{ matrix.bu }}-${{ matrix.env-name }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bu: ["lmfr", "lmes"]
+        env-name: ["uat"]
+        exclude:
+          - bu: lmes
+            env-name: uat
+    steps:
+      - name: 🔐 Get secrets from Vault
+        uses: adeo/vault-action@v1
+        with:
+          exportToken: true
+          vault-namespace: ${{ env.VAULT_NAMESPACE }}
+          vault-jwt-role-name: ${{ github.event.repository.name }}
+          vault-secrets: |
+            secret/data/_services/jfrog reader_user_auth_token | JFROG_READER_AUTH_TOKEN ;
+            secret/data/playwright/ci JIRA_TOKEN ;
+      - name: ⬇️ Checkout the latest code
+        uses: actions/checkout@v4
+      - name: ⬇️ install node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+      - name: 🎮 ${{ matrix.bu }} ${{ matrix.env-name }} - Run GUI Playwright tests
+        run: CONTEXT=${{ matrix.bu }}-${{ matrix.env-name }} npx playwright test ./tests/pom/ --grep-invert @skip --grep "CDM-3125"
+        if: success() || failure()
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: results-${{ matrix.bu }}-${{ matrix.env-name }}.json
+          path: ./reports/results-${{ matrix.bu }}-${{ matrix.env-name }}.json
+          retention-days: 1
